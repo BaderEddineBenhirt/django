@@ -12,6 +12,7 @@ from django.db import connections
 from django.utils import autoreload
 from django.utils.regex_helper import _lazy_re_compile
 from django.utils.version import get_docs_version
+from pathlib import Path
 
 naiveip_re = _lazy_re_compile(
     r"""^(?:
@@ -23,6 +24,47 @@ naiveip_re = _lazy_re_compile(
     re.X,
 )
 
+
+# django/core/management/commands/runserver.py
+
+from pathlib import Path
+
+from django.conf import settings
+from django.dispatch import receiver
+from django.utils.autoreload import autoreload_started
+
+def _validate_watch_config():
+    files = getattr(settings, "RUNSERVER_WATCHFILES", [])
+    dirs = getattr(settings, "RUNSERVER_WATCHDIRS", [])
+
+    if not isinstance(files, (list, tuple)):
+        raise TypeError("RUNSERVER_WATCHFILES must be a list/tuple of paths.")
+    if not isinstance(dirs, (list, tuple)):
+        raise TypeError("RUNSERVER_WATCHDIRS must be a list/tuple of (path, pattern) tuples.")
+
+    norm_files = []
+    for p in files:
+        pp = Path(p)
+        norm_files.append(pp)
+
+    norm_dirs = []
+    for item in dirs:
+        if not (isinstance(item, (list, tuple)) and len(item) == 2):
+            raise TypeError("Each entry in RUNSERVER_WATCHDIRS must be a (path, pattern) tuple.")
+        d, pattern = item
+        norm_dirs.append((Path(d), str(pattern)))
+
+    return norm_files, norm_dirs
+
+def _register_runserver_watchers():
+    files, dirs = _validate_watch_config()
+    reloader = autoreload.get_reloader()
+
+    for f in files:
+        reloader.watch_dir(f.parent, f.name)
+
+    for d, pattern in dirs:
+        reloader.watch_dir(d, pattern)
 
 class Command(BaseCommand):
     help = "Starts a lightweight web server for development."
@@ -122,7 +164,8 @@ class Command(BaseCommand):
         # If an exception was silenced in ManagementUtility.execute in order
         # to be raised in the child process, raise it now.
         autoreload.raise_last_exception()
-
+        if options.get("use_reloader", True):
+            _register_runserver_watchers()
         threading = options["use_threading"]
         # 'shutdown_message' is a stealth option.
         shutdown_message = options.get("shutdown_message", "")

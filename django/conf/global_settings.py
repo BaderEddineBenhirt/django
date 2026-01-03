@@ -678,3 +678,7 @@ URLIZE_ASSUME_HTTPS = False
 # TASKS #
 #########
 TASKS = {"default": {"BACKEND": "django.tasks.backends.immediate.ImmediateBackend"}}
+# List of extra files that should trigger runserver autoreload when changed.
+RUNSERVER_WATCHFILES = []
+# List of (directory, glob_pattern) tuples to watch for changes.
+RUNSERVER_WATCHDIRS = []
