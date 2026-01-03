@@ -679,3 +679,7 @@ SECURE_REDIRECT_EXEMPT = []
 SECURE_REFERRER_POLICY = "same-origin"
 SECURE_SSL_HOST = None
 SECURE_SSL_REDIRECT = False
+# List of extra files that should trigger runserver autoreload when changed.
+RUNSERVER_WATCHFILES = []
+# List of (directory, glob_pattern) tuples to watch for changes.
+RUNSERVER_WATCHDIRS = []
