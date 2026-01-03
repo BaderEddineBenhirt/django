@@ -20,7 +20,8 @@ from django.core.signals import request_finished
 from django.dispatch import Signal
 from django.utils.functional import cached_property
 from django.utils.version import get_version_tuple
-
+from django.conf import settings
+from fnmatch import fnmatch
 autoreload_started = Signal()
 file_changed = Signal()
 
@@ -193,7 +194,7 @@ def common_roots(paths):
     # Turn the tree into a list of Path instances.
     def _walk(node, path):
         for prefix, child in node.items():
-            yield from _walk(child, [*path, prefix])
+            yield from _walk(child, path + (prefix,))
         if not node:
             yield Path(*path)
 
@@ -226,10 +227,9 @@ def get_child_arguments():
     import __main__
 
     py_script = Path(sys.argv[0])
-    exe_entrypoint = py_script.with_suffix(".exe")
 
     args = [sys.executable] + ["-W%s" % o for o in sys.warnoptions]
-    if sys.implementation.name in ("cpython", "pypy"):
+    if sys.implementation.name == "cpython":
         args.extend(
             f"-X{key}" if value is True else f"-X{key}={value}"
             for key, value in sys._xoptions.items()
@@ -237,7 +237,7 @@ def get_child_arguments():
     # __spec__ is set when the server was started with the `-m` option,
     # see https://docs.python.org/3/reference/import.html#main-spec
     # __spec__ may not exist, e.g. when running in a Conda env.
-    if getattr(__main__, "__spec__", None) is not None and not exe_entrypoint.exists():
+    if getattr(__main__, "__spec__", None) is not None:
         spec = __main__.__spec__
         if (spec.name == "__main__" or spec.name.endswith(".__main__")) and spec.parent:
             name = spec.parent
@@ -248,6 +248,7 @@ def get_child_arguments():
     elif not py_script.exists():
         # sys.argv[0] may not exist for several reasons on Windows.
         # It may exist with a .exe extension or have a -script.py suffix.
+        exe_entrypoint = py_script.with_suffix(".exe")
         if exe_entrypoint.exists():
             # Should be executed directly, ignoring sys.executable.
             return [exe_entrypoint, *sys.argv[1:]]
@@ -268,19 +269,6 @@ def trigger_reload(filename):
 
 def restart_with_reloader():
     new_environ = {**os.environ, DJANGO_AUTORELOAD_ENV: "true"}
-    orig = getattr(sys, "orig_argv", ())
-    if any(
-        (arg == "-u")
-        or (
-            arg.startswith("-")
-            and not arg.startswith(("--", "-X", "-W"))
-            and len(arg) > 2
-            and arg[1:].isalpha()
-            and "u" in arg
-        )
-        for arg in orig[1:]
-    ):
-        new_environ.setdefault("PYTHONUNBUFFERED", "1")
     args = get_child_arguments()
     while True:
         p = subprocess.run(args, env=new_environ, close_fds=False)
@@ -393,12 +381,18 @@ class BaseReloader:
         self._stop_condition.set()
 
 
+
 class StatReloader(BaseReloader):
     SLEEP_TIME = 1  # Check for changes once per second.
+    COALESCE_POLL = 0.05  # Polling interval during debounce window.
 
     def tick(self):
         mtimes = {}
+        debounce = float(getattr(settings, "RUNSERVER_RELOAD_DEBOUNCE", 0) or 0)
+
         while True:
+            changed_path = None
+
             for filepath, mtime in self.snapshot_files():
                 old_time = mtimes.get(filepath)
                 mtimes[filepath] = mtime
@@ -412,7 +406,29 @@ class StatReloader(BaseReloader):
                         old_time,
                         mtime,
                     )
-                    self.notify_file_changed(filepath)
+                    changed_path = filepath
+                    break
+
+            if changed_path is not None and debounce > 0:
+                deadline = time.monotonic() + debounce
+                poll = min(self.COALESCE_POLL, debounce)
+
+                while time.monotonic() < deadline:
+                    time.sleep(poll)
+
+                    found_new = False
+                    for filepath, mtime in self.snapshot_files():
+                        old_time = mtimes.get(filepath)
+                        mtimes[filepath] = mtime
+                        if old_time is not None and mtime > old_time:
+                            changed_path = filepath
+                            found_new = True
+
+                    if found_new:
+                        deadline = time.monotonic() + debounce
+
+            if changed_path is not None:
+                self.notify_file_changed(changed_path)
 
             time.sleep(self.SLEEP_TIME)
             yield
@@ -420,20 +436,33 @@ class StatReloader(BaseReloader):
     def snapshot_files(self):
         # watched_files may produce duplicate paths if globs overlap.
         seen_files = set()
+
+        ignore_patterns = []
+        ignore = getattr(settings, "RUNSERVER_WATCHIGNORE", None)
+        if isinstance(ignore, (list, tuple)):
+            ignore_patterns = list(ignore)
+
         for file in self.watched_files():
             if file in seen_files:
                 continue
+            seen_files.add(file)
+
+            name = getattr(file, "name", "")
+            if ignore_patterns and any(fnmatch(name, pat) for pat in ignore_patterns):
+                continue
+
             try:
                 mtime = file.stat().st_mtime
             except OSError:
                 # This is thrown when the file does not exist.
                 continue
-            seen_files.add(file)
+
             yield file, mtime
 
     @classmethod
     def check_availability(cls):
         return True
+
 
 
 class WatchmanUnavailable(RuntimeError):
@@ -481,9 +510,8 @@ class WatchmanReloader(BaseReloader):
 
     def _subscribe(self, directory, name, expression):
         root, rel_path = self._watch_root(directory)
-        # Only receive notifications of files changing, filtering out other
-        # types like special files:
-        # https://facebook.github.io/watchman/docs/type
+        # Only receive notifications of files changing, filtering out other types
+        # like special files: https://facebook.github.io/watchman/docs/type
         only_files_expression = [
             "allof",
             ["anyof", ["type", "f"], ["type", "l"]],

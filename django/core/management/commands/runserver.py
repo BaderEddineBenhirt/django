@@ -5,6 +5,9 @@ import socket
 import sys
 from datetime import datetime
 
+
+from pathlib import Path
+from typing import Iterable, List, Sequence, Tuple, Union
 from django.conf import settings
 from django.core.management.base import BaseCommand, CommandError
 from django.core.servers.basehttp import WSGIServer, get_internal_wsgi_application, run
@@ -12,7 +15,9 @@ from django.db import connections
 from django.utils import autoreload
 from django.utils.regex_helper import _lazy_re_compile
 from django.utils.version import get_docs_version
-from pathlib import Path
+from django.dispatch import receiver
+from django.utils.autoreload import autoreload_started
+import warnings
 
 naiveip_re = _lazy_re_compile(
     r"""^(?:
@@ -24,47 +29,131 @@ naiveip_re = _lazy_re_compile(
     re.X,
 )
 
+PathLike = Union[str, Path]
+WatchDirSpec = Tuple[PathLike, str]
 
-# django/core/management/commands/runserver.py
+def _validate_watch_config() -> Tuple[List[Path], List[Tuple[Path, str]]]:
+    """
+    Validate and normalize runserver watch configuration.
 
-from pathlib import Path
+    Supported development-only settings:
 
-from django.conf import settings
-from django.dispatch import receiver
-from django.utils.autoreload import autoreload_started
+    - RUNSERVER_WATCHFILES:
+        Iterable of file paths (str or Path) that influence project settings.
 
-def _validate_watch_config():
+    - RUNSERVER_WATCHDIRS:
+        Iterable of (directory, glob_pattern) tuples used to watch
+        groups of configuration files.
+
+    Paths are normalized to Path objects. Relative paths are accepted
+    but emit a warning; absolute paths are recommended.
+
+    Returns:
+        A tuple (files, dirs) where:
+        - files is a list of Path objects.
+        - dirs is a list of (Path, pattern) tuples.
+
+    Raises:
+        TypeError: If configuration values have invalid types or structure.
+    """
     files = getattr(settings, "RUNSERVER_WATCHFILES", [])
     dirs = getattr(settings, "RUNSERVER_WATCHDIRS", [])
 
     if not isinstance(files, (list, tuple)):
-        raise TypeError("RUNSERVER_WATCHFILES must be a list/tuple of paths.")
+        raise TypeError(
+            "RUNSERVER_WATCHFILES must be a list or tuple of paths.\n"
+            "Example:\n"
+            "    RUNSERVER_WATCHFILES = [BASE_DIR / '.env', BASE_DIR / 'config/settings.yaml']"
+        )
+
     if not isinstance(dirs, (list, tuple)):
-        raise TypeError("RUNSERVER_WATCHDIRS must be a list/tuple of (path, pattern) tuples.")
+        raise TypeError(
+            "RUNSERVER_WATCHDIRS must be a list or tuple of (path, pattern) tuples.\n"
+            "Example:\n"
+            "    RUNSERVER_WATCHDIRS = [(BASE_DIR / 'config', '*.toml')]"
+        )
 
-    norm_files = []
-    for p in files:
-        pp = Path(p)
-        norm_files.append(pp)
+    norm_files: List[Path] = []
+    for item in files:
+        path = Path(item).expanduser()
+        if not path.is_absolute():
+            warnings.warn(
+                f"Relative path detected in RUNSERVER_WATCHFILES: {path!s}. "
+                "Absolute paths (e.g. BASE_DIR / ...) are recommended.",
+                RuntimeWarning,
+            )
+        norm_files.append(path)
 
-    norm_dirs = []
-    for item in dirs:
-        if not (isinstance(item, (list, tuple)) and len(item) == 2):
-            raise TypeError("Each entry in RUNSERVER_WATCHDIRS must be a (path, pattern) tuple.")
-        d, pattern = item
-        norm_dirs.append((Path(d), str(pattern)))
+    norm_dirs: List[Tuple[Path, str]] = []
+    for entry in dirs:
+        if not (isinstance(entry, (list, tuple)) and len(entry) == 2):
+            raise TypeError(
+                "Each RUNSERVER_WATCHDIRS entry must be a (path, pattern) tuple.\n"
+                "Example:\n"
+                "    RUNSERVER_WATCHDIRS = [(BASE_DIR / 'config', '*.toml')]"
+            )
+
+        directory, pattern = entry
+        directory = Path(directory).expanduser()
+        pattern = str(pattern)
+
+        if not directory.is_absolute():
+            warnings.warn(
+                f"Relative directory detected in RUNSERVER_WATCHDIRS: {directory!s}. "
+                "Absolute paths (e.g. BASE_DIR / ...) are recommended.",
+                RuntimeWarning,
+            )
+
+        if pattern in {"*", "**", "**/*"}:
+            warnings.warn(
+                f"Broad glob pattern detected in RUNSERVER_WATCHDIRS: {pattern!r}. "
+                "Such patterns may significantly degrade autoreload performance.",
+                RuntimeWarning,
+            )
+
+        norm_dirs.append((directory, pattern))
 
     return norm_files, norm_dirs
 
-def _register_runserver_watchers():
+def _file_family_pattern(path: Path) -> str:
+    """
+    Return a glob pattern suitable for watching a single configuration file.
+
+    The returned pattern accounts for:
+    - dotfile variants (e.g. '.env', '.env.local'),
+    - atomic save strategies based on temporary files and rename operations.
+
+    The pattern is intended for use with watch_dir() on the parent directory
+    and avoids overly broad directory scans.
+    """
+    name = path.name
+
+    if name.startswith("."):
+        return f"{name}*"
+
+    stem = path.stem
+    suffix = path.suffix
+    if suffix:
+        return f"{stem}*{suffix}"
+
+    return name
+
+@receiver(autoreload_started)
+def _watch_declared_settings_inputs(sender, **kwargs) -> None:
+    """
+    Register declared non-Python configuration inputs with the autoreloader.
+
+    When any declared input changes, the development server process is
+    restarted, ensuring that updated settings are applied consistently.
+    """
     files, dirs = _validate_watch_config()
-    reloader = autoreload.get_reloader()
 
-    for f in files:
-        reloader.watch_dir(f.parent, f.name)
+    for file_path in files:
+        pattern = _file_family_pattern(file_path)
+        sender.watch_dir(file_path.parent, pattern)
 
-    for d, pattern in dirs:
-        reloader.watch_dir(d, pattern)
+    for directory, pattern in dirs:
+        sender.watch_dir(directory, pattern)
 
 class Command(BaseCommand):
     help = "Starts a lightweight web server for development."
@@ -164,8 +253,7 @@ class Command(BaseCommand):
         # If an exception was silenced in ManagementUtility.execute in order
         # to be raised in the child process, raise it now.
         autoreload.raise_last_exception()
-        if options.get("use_reloader", True):
-            _register_runserver_watchers()
+
         threading = options["use_threading"]
         # 'shutdown_message' is a stealth option.
         shutdown_message = options.get("shutdown_message", "")
