@@ -20,6 +20,8 @@ from django.core.signals import request_finished
 from django.dispatch import Signal
 from django.utils.functional import cached_property
 from django.utils.version import get_version_tuple
+from django.conf import settings
+from fnmatch import fnmatch
 
 autoreload_started = Signal()
 file_changed = Signal()
@@ -380,47 +382,89 @@ class BaseReloader:
         self._stop_condition.set()
 
 
+
 class StatReloader(BaseReloader):
     SLEEP_TIME = 1  # Check for changes once per second.
+    COALESCE_POLL = 0.05  # 50ms polling during debounce window.
 
     def tick(self):
         mtimes = {}
+
+        # Debounce window in seconds. Default 0 keeps legacy behavior.
+        debounce = float(getattr(settings, "RUNSERVER_RELOAD_DEBOUNCE", 0) or 0)
+
         while True:
-            for filepath, mtime in self.snapshot_files():
-                old_time = mtimes.get(filepath)
-                mtimes[filepath] = mtime
-                if old_time is None:
-                    logger.debug("File %s first seen with mtime %s", filepath, mtime)
-                    continue
-                elif mtime > old_time:
-                    logger.debug(
-                        "File %s previous mtime: %s, current mtime: %s",
-                        filepath,
-                        old_time,
-                        mtime,
-                    )
-                    self.notify_file_changed(filepath)
+            changed = self._scan_for_changes(mtimes)
+
+            if changed:
+                if debounce > 0:
+                    self._coalesce_changes(mtimes, changed, debounce)
+
+                # One reload is enough; pass a representative path.
+                self.notify_file_changed(next(iter(changed)))
 
             time.sleep(self.SLEEP_TIME)
             yield
 
-    def snapshot_files(self):
-        # watched_files may produce duplicate paths if globs overlap.
-        seen_files = set()
-        for file in self.watched_files():
-            if file in seen_files:
-                continue
-            try:
-                mtime = file.stat().st_mtime
-            except OSError:
-                # This is thrown when the file does not exist.
-                continue
-            seen_files.add(file)
-            yield file, mtime
+    def _coalesce_changes(self, mtimes, changed, debounce):
+        """
+        Coalesce rapid successive changes into a single reload.
 
-    @classmethod
-    def check_availability(cls):
-        return True
+        Wait until filesystem has been quiet for `debounce` seconds.
+        Extend the window if new changes occur during the wait.
+        """
+        deadline = time.monotonic() + debounce
+        poll = min(self.COALESCE_POLL, debounce)
+
+        while True:
+            time.sleep(poll)
+            more = self._scan_for_changes(mtimes)
+            if more:
+                changed.update(more)
+                deadline = time.monotonic() + debounce
+            if time.monotonic() >= deadline:
+                break
+
+    def _scan_for_changes(self, mtimes):
+        """
+        Return a set of changed file paths since last scan, updating `mtimes`.
+
+        Applies ignore patterns to reduce noisy reloads from editor temp files.
+        """
+        changed = set()
+        seen_files = set()
+
+        ignore = getattr(settings, "RUNSERVER_WATCHIGNORE", None)
+        ignore_patterns = list(ignore) if isinstance(ignore, (list, tuple)) else []
+
+        # Reasonable defaults (only used by StatReloader scan).
+        ignore_patterns += [
+            "*~", "*.swp", "*.swo", "*.tmp", "*.temp", "*.bak",
+            ".#*", "#*#", "*.orig",
+        ]
+
+        for path in self.watched_files():
+            if path in seen_files:
+                continue
+            seen_files.add(path)
+
+            name = path.name
+            if any(fnmatch(name, pat) for pat in ignore_patterns):
+                continue
+
+            try:
+                mtime = path.stat().st_mtime
+            except OSError:
+                # File may not exist temporarily during save/rename.
+                continue
+
+            old_time = mtimes.get(path)
+            mtimes[path] = mtime
+
+            if old_time is not None and mtime > old_time:
+                changed.add(path)
+
+        return changed
 
 
 class WatchmanUnavailable(RuntimeError):
